@@ -1,24 +1,16 @@
-def dynamic_range_compression(x, C=1, clip_val=1e-5):
-    return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
+import random
 
+def random_values_sum_to_1(n):
+    # Generate n-1 random numbers between 0 and 1
+    rand_nums = sorted(random.random() for _ in range(n - 1))
+    
+    # Calculate differences between consecutive numbers
+    values = [rand_nums[0]] + [rand_nums[i] - rand_nums[i - 1] for i in range(1, n - 1)] + [1 - rand_nums[-1]]
+    
+    return values
 
-def dynamic_range_decompression(x, C=1):
-    return np.exp(x) / C
-
-
-def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
-    return torch.log(torch.clamp(x, min=clip_val) * C)
-
-
-def dynamic_range_decompression_torch(x, C=1):
-    return torch.exp(x) / C
-
-
-def spectral_normalize_torch(magnitudes):
-    output = dynamic_range_compression_torch(magnitudes)
-    return output
-
-
-def spectral_de_normalize_torch(magnitudes):
-    output = dynamic_range_decompression_torch(magnitudes)
-    return output
+# Example: Generate 5 random values that sum to 1
+n = 5
+values = random_values_sum_to_1(n)
+print(values)
+print("Sum:", sum(values))
