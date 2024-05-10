@@ -1,19 +1,28 @@
-        F = self.hop_size
-        W = self.win_size
-        N = (est_targets.shape[-1] - W) // F + 1
-        B = est_targets.shape[0]
-        en_thres = self.en_thres
-        snr_thres = self.snr_thres
-        tmp_loss = []
-        energy = []
-        alpha, beta = 2.0, 1.0
+H = self.hop_size
+W = self.win_size
+N = (est_targets.shape[-1] - W) // F + 1
+B = est_targets.shape[0]
+en_thres = self.en_thres
+snr_thres = self.snr_thres
+alpha, beta, gamma = self.alpha, self.beta, self.gamma
 
-        for i in range(B):
-            est_targets_segments = est_targets
+enh_loss = 0.
 
-            en = torch.sum(x1[F*i:F*i+W]**2) / F
-            energy.append(en)
-            snr = singlesrc_neg_sisdr(x1.unsqueeze(0)[:, F*i:F*i+W], x2.unsqueeze(0)[:, F*i:F*i+W]).mean()
-            if en > en_thres: 
-                if snr > snr_thres:
-                    tmp_loss.append(snr)
+for i in range(B):
+    
+    est_targets_segments = est_targets[i].squeeze().unfold(0, W, H)
+    targets_segments = targets[i].squeeze().unfold(0, W, H)
+    
+    en_targets_segments = torch.sum(est_targets_segments**2, dim=1) / H
+    est_targets_segments = est_targets_segments[en_targets_segments > en_thres]
+    targets_segments = targets_segments[en_targets_segments > en_thres]
+    others_segments = others_segments[en_targets_segments > en_thres]
+    
+    snr = singlesrc_neg_sisdr(est_targets_segments, targets_segments)
+    snr2 = singlesrc_neg_sisdr(est_targets_segments, others_segments)
+    
+    enh_loss += self.alpha * snr[snr>snr_thres] + \
+        self.beta * snr_thres[(snr<snr_thres) & (snr>snr2)] + \
+        self.gamma * snr_thres[(snr<snr_thres) & (snr<=snr2)]
+
+enh_loss /= B
