@@ -1,16 +1,19 @@
-F = 1600
-W = 3200
-N = (x1.shape[-1] - W) // F + 1
-en_thres = 1e-4
-snr_thres = -5.
-tmp_loss = []
-energy = []
-alpha, beta = 2.0, 1.0
-for i in range(N):
-    # print(F.mse_loss(mel_est_targets[:,i*N:(i+1)*N],mel_targets[:,i*N:(i+1)*N]).item())
-    en = torch.sum(x1[F*i:F*i+W]**2) / F
-    energy.append(en)
-    snr = singlesrc_neg_sisdr(x1.unsqueeze(0)[:, F*i:F*i+W], x2.unsqueeze(0)[:, F*i:F*i+W]).mean()
-    if en > en_thres: 
-        if snr > snr_thres:
-            tmp_loss.append(snr)
+        F = self.hop_size
+        W = self.win_size
+        N = (est_targets.shape[-1] - W) // F + 1
+        B = est_targets.shape[0]
+        en_thres = self.en_thres
+        snr_thres = self.snr_thres
+        tmp_loss = []
+        energy = []
+        alpha, beta = 2.0, 1.0
+
+        for i in range(B):
+            est_targets_segments = est_targets
+
+            en = torch.sum(x1[F*i:F*i+W]**2) / F
+            energy.append(en)
+            snr = singlesrc_neg_sisdr(x1.unsqueeze(0)[:, F*i:F*i+W], x2.unsqueeze(0)[:, F*i:F*i+W]).mean()
+            if en > en_thres: 
+                if snr > snr_thres:
+                    tmp_loss.append(snr)
