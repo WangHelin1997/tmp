@@ -1,284 +1,104 @@
-import torch
-import pytorch_lightning as pl
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+# Copyright (c) 2021 Brno University of Technology
+# Copyright (c) 2021 Nippon Telegraph and Telephone corporation (NTT).
+# All rights reserved
+# By Katerina Zmolikova, August 2021.
 
-from asteroid.utils import flatten_dict
-import math
-import os
-import random
-
-import librosa
+from pathlib import Path
+from collections import defaultdict
 import numpy as np
-import torch.utils.data
-import torch.nn.functional as F
-from torchaudio.transforms import MelSpectrogram
+from torch.utils.data import Dataset
+from asteroid.data import LibriMix
+import random
+import torch
+import soundfile as sf
 
+def read_enrollment_csv(csv_path):
+    data = defaultdict(dict)
+    with open(csv_path, 'r') as f:
+        f.readline() # csv header
 
-def random_values(n, same=False):
-    if same:
-        return [1/n] * n
-    # Generate n-1 random numbers between 0 and 1
-    rand_nums = sorted(random.random() for _ in range(n - 1))
-    
-    # Calculate differences between consecutive numbers
-    values = [rand_nums[0]] + [rand_nums[i] - rand_nums[i - 1] for i in range(1, n - 1)] + [1 - rand_nums[-1]]
-    
-    return values
+        for line in f:
+            mix_id, utt_id, *aux = line.strip().split(',')
+            aux_it = iter(aux)
+            aux = [(auxpath,int(float(length))) for auxpath, length in zip(aux_it, aux_it)]
+            data[mix_id][utt_id] = aux
+    return data
 
-
-class SystemInformed_Enh(pl.LightningModule):
-    """Base class for deep learning systems.
-    Contains a model, an optimizer, a loss function, training and validation
-    dataloaders and learning rate scheduler.
-
-    Note that by default, any PyTorch-Lightning hooks are *not* passed to the model.
-    If you want to use Lightning hooks, add the hooks to a subclass::
-
-        class MySystem(System):
-            def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
-                return self.model.on_train_batch_start(batch, batch_idx, dataloader_idx)
-
-    Args:
-        model (torch.nn.Module): Instance of model.
-        optimizer (torch.optim.Optimizer): Instance or list of optimizers.
-        loss_func (callable): Loss function with signature
-            (est_targets, targets).
-        train_loader (torch.utils.data.DataLoader): Training dataloader.
-        val_loader (torch.utils.data.DataLoader): Validation dataloader.
-        scheduler (torch.optim.lr_scheduler._LRScheduler): Instance, or list
-            of learning rate schedulers. Also supports dict or list of dict as
-            ``{"interval": "step", "scheduler": sched}`` where ``interval=="step"``
-            for step-wise schedulers and ``interval=="epoch"`` for classical ones.
-        config: Anything to be saved with the checkpoints during training.
-            The config dictionary to re-instantiate the run for example.
-
-    .. note:: By default, ``training_step`` (used by ``pytorch-lightning`` in the
-        training loop) and ``validation_step`` (used for the validation loop)
-        share ``common_step``. If you want different behavior for the training
-        loop and the validation loop, overwrite both ``training_step`` and
-        ``validation_step`` instead.
-
-    For more info on its methods, properties and hooks, have a look at lightning's docs:
-    https://pytorch-lightning.readthedocs.io/en/stable/lightning_module.html#lightningmodule-api
-    """
-
-    default_monitor: str = "val_loss"
-
+class LibriMixInformed_Enh(Dataset):
     def __init__(
-        self,
-        model,
-        optimizer,
-        loss_func,
-        enhloss_ratio,
-        n_fft,
-        num_mels,
-        sampling_rate,
-        hop_size,
-        win_size,
-        fmin,
-        fmax,
-        times,
-        k,
-        train_loader,
-        val_loader=None,
-        scheduler=None,
-        config=None,
-    ):
-        super().__init__()
-        self.model = model
-        self.optimizer = optimizer
-        self.loss_func = loss_func
-        self.enhloss_ratio = enhloss_ratio
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.scheduler = scheduler
-        self.config = {} if config is None else config
-        # Save lightning's AttributeDict under self.hparams
-        self.save_hyperparameters(self.config_to_hparams(self.config))
+        self, csv_dir, task="sep_clean", sample_rate=16000, n_src=2, 
+        segment=3, segment_aux=3, 
+        ):
+        self.base_dataset = LibriMix(csv_dir, task, sample_rate, n_src, segment)
+        self.data_aux = read_enrollment_csv(Path(csv_dir) / 'mixture2enrollment.csv')
 
-        # Settings for enhanced loss
-        self.n_fft = n_fft
-        self.num_mels = num_mels
-        self.sampling_rate = sampling_rate
-        self.hop_size = hop_size
-        self.win_size = win_size
-        self.fmin = fmin
-        self.fmax = fmax
-        self.times = times
-        self.k = k
-        self.melspec = MelSpectrogram(
-            sample_rate=sampling_rate,
-            n_fft=n_fft,
-            n_mels=num_mels,
-            hop_length=hop_size,
-            win_length=win_size,
-            f_min=fmin,
-            f_max=fmax,
-        )
-
-    def forward(self, *args, **kwargs):
-        """Applies forward pass of the model.
-
-        Returns:
-            :class:`torch.Tensor`
-        """
-        return self.model(*args, **kwargs)
-
-    def common_step(self, batch, batch_nb, train=True):
-        """Common forward step between training and validation.
-
-        The function of this method is to unpack the data given by the loader,
-        forward the batch through the model and compute the loss.
-        Pytorch-lightning handles all the rest.
-
-        Args:
-            batch: the object returned by the loader (a list of torch.Tensor
-                in most cases) but can be something else.
-            batch_nb (int): The number of the batch in the epoch.
-            train (bool): Whether in training mode. Needed only if the training
-                and validation steps are fundamentally different, otherwise,
-                pytorch-lightning handles the usual differences.
-
-        Returns:
-            :class:`torch.Tensor` : The loss value on this batch.
-
-        .. note::
-            This is typically the method to overwrite when subclassing
-            ``System``. If the training and validation steps are somehow
-            different (except for ``loss.backward()`` and ``optimzer.step()``),
-            the argument ``train`` can be used to switch behavior.
-            Otherwise, ``training_step`` and ``validation_step`` can be overwriten.
-        """
-        inputs, targets, enrolls = batch
-        
-        est_targets = self(inputs, enrolls)
-        loss_sisnr = self.loss_func(est_targets, targets)
-
-        mel_est_targets = self.melspec(est_targets.squeeze())
-        mel_targets = self.melspec(targets.squeeze())
-
-        
-        # multiple time loss
-        time_loss = 0.
-        for T in self.times:
-            N = mel_est_targets.shape[2] // T
-            tmp_loss = []
-            for i in range(T):
-                tmp_loss.append(F.mse_loss(mel_est_targets[:,:,i*N:(i+1)*N],mel_targets[:,:,i*N:(i+1)*N]).item())
-            _, max_index = torch.topk(torch.tensor(tmp_loss), k=self.k)
-            max_index = max_index.tolist()
-            # print(max_index)
-            for j in range(self.k):
-                # print(est_targets.shape, targets.shape)
-                time_loss += self.loss_func(est_targets[:, :, (self.hop_size*N*max_index[j]):(self.hop_size*N*(max_index[j]+1))], targets[:, :, (self.hop_size*N*max_index[j]):(self.hop_size*N*(max_index[j]+1))])
-        time_loss /= self.k * len(self.times)
-        loss = loss_sisnr + time_loss * self.enhloss_ratio
-
-        return loss, loss_sisnr, time_loss
-
-
-    def training_step(self, batch, batch_nb):
-        """Pass data through the model and compute the loss.
-
-        Backprop is **not** performed (meaning PL will do it for you).
-
-        Args:
-            batch: the object returned by the loader (a list of torch.Tensor
-                in most cases) but can be something else.
-            batch_nb (int): The number of the batch in the epoch.
-
-        Returns:
-            torch.Tensor, the value of the loss.
-        """
-        loss, loss_sisnr, time_loss = self.common_step(batch, batch_nb, train=True)
-        self.log("loss", loss, logger=True)
-        self.log("loss_sisnr", loss_sisnr, logger=True)
-        self.log("time_loss", time_loss, logger=True)
-        return loss
-
-    def validation_step(self, batch, batch_nb):
-        """Need to overwrite PL validation_step to do validation.
-
-        Args:
-            batch: the object returned by the loader (a list of torch.Tensor
-                in most cases) but can be something else.
-            batch_nb (int): The number of the batch in the epoch.
-        """
-        loss, loss_sisnr, time_loss = self.common_step(batch, batch_nb, train=False)
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("val_loss_sisnr", loss_sisnr, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("val_time_loss", time_loss, on_epoch=True, prog_bar=True, sync_dist=True)
-
-    def on_validation_epoch_end(self):
-        """Log hp_metric to tensorboard for hparams selection."""
-        hp_metric = self.trainer.callback_metrics.get("val_loss", None)
-        if hp_metric is not None:
-            self.trainer.logger.log_metrics({"hp_metric": hp_metric}, step=self.trainer.global_step)
-
-    def configure_optimizers(self):
-        """Initialize optimizers, batch-wise and epoch-wise schedulers."""
-        if self.scheduler is None:
-            return self.optimizer
-
-        if not isinstance(self.scheduler, (list, tuple)):
-            self.scheduler = [self.scheduler]  # support multiple schedulers
-
-        epoch_schedulers = []
-        for sched in self.scheduler:
-            if not isinstance(sched, dict):
-                if isinstance(sched, ReduceLROnPlateau):
-                    sched = {"scheduler": sched, "monitor": self.default_monitor}
-                epoch_schedulers.append(sched)
-            else:
-                sched.setdefault("monitor", self.default_monitor)
-                sched.setdefault("frequency", 1)
-                # Backward compat
-                if sched["interval"] == "batch":
-                    sched["interval"] = "step"
-                assert sched["interval"] in [
-                    "epoch",
-                    "step",
-                ], "Scheduler interval should be either step or epoch"
-                epoch_schedulers.append(sched)
-        return [self.optimizer], epoch_schedulers
-
-    def lr_scheduler_step(self, scheduler, metric):
-        if metric is None:
-            scheduler.step()
+        if segment_aux is not None:
+            max_len = np.sum([len(self.data_aux[m][u]) for m in self.data_aux 
+                                                     for u in self.data_aux[m]])
+            self.seg_len_aux = int(segment_aux * sample_rate)
+            self.data_aux = {m: {u:  
+                [(path,length) for path, length in self.data_aux[m][u]
+                    if length >= self.seg_len_aux
+                    ]
+                for u in self.data_aux[m]} for m in self.data_aux}
+            new_len = np.sum([len(self.data_aux[m][u]) for m in self.data_aux 
+                                                     for u in self.data_aux[m]])
+            print(
+                f"Drop {max_len - new_len} utterances from {max_len} "
+                f"(shorter than {segment_aux} seconds)"
+            )
         else:
-            scheduler.step(metric)
+            self.seg_len_aux = None
 
-    def train_dataloader(self):
-        """Training dataloader"""
-        return self.train_loader
+        self.seg_len = self.base_dataset.seg_len
 
-    def val_dataloader(self):
-        """Validation dataloader"""
-        return self.val_loader
+        # to choose pair of mixture and target speaker by index
+        self.data_aux_list = [(m,u) for m in self.data_aux 
+                                    for u in self.data_aux[m]]
 
-    def on_save_checkpoint(self, checkpoint):
-        """Overwrite if you want to save more things in the checkpoint."""
-        checkpoint["training_config"] = self.config
-        return checkpoint
+    def __len__(self):
+        return len(self.data_aux_list)
 
-    @staticmethod
-    def config_to_hparams(dic):
-        """Sanitizes the config dict to be handled correctly by torch
-        SummaryWriter. It flatten the config dict, converts ``None`` to
-        ``"None"`` and any list and tuple into torch.Tensors.
+    def _get_segment_start_stop(self, seg_len, length):
+        if seg_len is not None:
+            start = random.randint(0, length - seg_len)
+            stop = start + seg_len
+        else:
+            start = 0
+            stop = None
+        return start, stop
 
-        Args:
-            dic (dict): Dictionary to be transformed.
+    def __getitem__(self, idx):
+        mix_id, utt_id = self.data_aux_list[idx]
+        row = self.base_dataset.df[self.base_dataset.df['mixture_ID'] == mix_id].squeeze()
 
-        Returns:
-            dict: Transformed dictionary.
-        """
-        dic = flatten_dict(dic)
-        for k, v in dic.items():
-            # print(k, v)
-            if v is None:
-                dic[k] = str(v)
-            elif isinstance(v, (list, tuple)):
-                # dic[k] = torch.tensor(v)
-                dic[k] = v
-        return dic
+        mixture_path = row['mixture_path']
+        self.mixture_path = mixture_path
+        tgt_spk_idx = mix_id.split('_').index(utt_id)
+        self.target_speaker_idx = tgt_spk_idx
+
+        # read mixture
+        start, stop = self._get_segment_start_stop(self.seg_len, row['length'])
+        mixture,_ = sf.read(mixture_path, dtype="float32", start=start, stop=stop)
+        mixture = torch.from_numpy(mixture)
+
+        # read source
+        source_path = row[f'source_{tgt_spk_idx+1}_path']
+        source,_ = sf.read(source_path, dtype="float32", start=start, stop=stop)
+        source = torch.from_numpy(source)[None]
+        
+        # read other source
+        source_path2 = source_path.replace("/s1/", "/s2/") if "/s1/" in source_path else source_path.replace("/s2/", "/s1/")
+        source2,_ = sf.read(source_path2, dtype="float32", start=start, stop=stop)
+        source2 = torch.from_numpy(source2)[None]
+        
+        # read enrollment
+        enroll_path, enroll_length = random.choice(self.data_aux[mix_id][utt_id])
+        start_e, stop_e = self._get_segment_start_stop(self.seg_len_aux, enroll_length)
+        enroll,_ = sf.read(enroll_path, dtype="float32", start=start_e, stop=stop_e)
+        enroll = torch.from_numpy(enroll)
+
+        return mixture, source, enroll, source2
+
+    def get_infos(self):
+        return self.base_dataset.get_infos()
