@@ -1,28 +1,85 @@
-H = self.hop_size
-W = self.win_size
-N = (est_targets.shape[-1] - W) // F + 1
-B = est_targets.shape[0]
-en_thres = self.en_thres
-snr_thres = self.snr_thres
-alpha, beta, gamma = self.alpha, self.beta, self.gamma
+# Copyright (c) 2021 Brno University of Technology
+# Copyright (c) 2021 Nippon Telegraph and Telephone corporation (NTT).
+# All rights reserved
+# By Katerina Zmolikova, August 2021.
 
-enh_loss = 0.
+# This code is based on Asteroid eval.py, 
+# which is released under the following MIT license:
+# https://github.com/asteroid-team/asteroid/blob/master/LICENSE
 
-for i in range(B):
-    
-    est_targets_segments = est_targets[i].squeeze().unfold(0, W, H)
-    targets_segments = targets[i].squeeze().unfold(0, W, H)
-    
-    en_targets_segments = torch.sum(est_targets_segments**2, dim=1) / H
-    est_targets_segments = est_targets_segments[en_targets_segments > en_thres]
-    targets_segments = targets_segments[en_targets_segments > en_thres]
-    others_segments = others_segments[en_targets_segments > en_thres]
-    
-    snr = singlesrc_neg_sisdr(est_targets_segments, targets_segments)
-    snr2 = singlesrc_neg_sisdr(est_targets_segments, others_segments)
-    
-    enh_loss += self.alpha * snr[snr>snr_thres] + \
-        self.beta * snr_thres[(snr<snr_thres) & (snr>snr2)] + \
-        self.gamma * snr_thres[(snr<snr_thres) & (snr<=snr2)]
+import os
+import random
+import torch
+import yaml
+import json
+import argparse
+import pandas as pd
+from tqdm import tqdm
+from pprint import pprint
+from pathlib import Path
 
-enh_loss /= B
+from datasets.librimix_informed import LibriMixInformed
+import csv
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--test_dir", type=str, required=True, help="Test directory including the csv files"
+)
+parser.add_argument(
+    "--task",
+    type=str,
+    required=True,
+    help="One of `enh_single`, `enh_both`, " "`sep_clean` or `sep_noisy`",
+)
+
+parser.add_argument("--exp_dir", default="exp/tmp", help="Experiment root")
+
+parser.add_argument(
+    "--out_dir",
+    type=str,
+    required=True,
+    help="Directory where the eval results" " will be stored",
+)
+
+def main(conf):
+    
+    test_set = LibriMixInformed(
+        csv_dir=conf["test_dir"],
+        task=conf["task"],
+        sample_rate=conf["sample_rate"],
+        n_src=conf["train_conf"]["data"]["n_src"],
+        segment=None,
+        segment_aux=None,
+    )  # Uses all segment length
+
+    cmds = []
+    for idx in tqdm(range(len(test_set))):
+        # Forward the network on the mixture.
+        _, _, _, source_path, mixture_path, enroll_path = test_set[idx]
+        mixture_name = test_set.mixture_path.split('/')[-1].split('.')[0]
+        pred_path = os.path.join(args.out_dir, f"{mixture_name}_"
+                                  f"s{test_set.target_speaker_idx}.wav")
+        cmds.append([pred_path, source_path, mixture_path, enroll_path])
+
+    with open('/data/lmorove1/hwang258/sgmse-bbed/test.csv', mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerows(cmds)
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    arg_dic = dict(vars(args))
+    # Load training config
+    conf_path = os.path.join(args.exp_dir, "conf.yml")
+    with open(conf_path) as f:
+        train_conf = yaml.safe_load(f)
+    arg_dic["sample_rate"] = train_conf["data"]["sample_rate"]
+    arg_dic["train_conf"] = train_conf
+
+    if args.task != arg_dic["train_conf"]["data"]["task"]:
+        print(
+            "Warning : the task used to test is different than "
+            "the one from training, be sure this is what you want."
+        )
+
+    main(arg_dic)
